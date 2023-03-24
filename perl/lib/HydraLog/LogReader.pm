@@ -172,9 +172,16 @@ to the C<start_epoch> of the log file.
 
 =over
 
+=item C<to_string>
+
+Not exactly an attribute, this renders the record in "a useful and sensible manner", which
+for now means timestamp in local time, level, facility, ident, and message.  It does not
+include a trailing newline.
+
 =item C<timestamp>
 
-Unix epoch number, which may contain a fraction if the timestamps are sub-second precision.
+Unix epoch number, which may contain fractional decimal places  if the timestamps are
+sub-second precision.
 
 =item C<timestamp_local>
 
@@ -270,6 +277,5 @@ package HydraLog::LogReader::Record {
 		return $_[0]{$field};
 	}
 }
-
 
 1;
