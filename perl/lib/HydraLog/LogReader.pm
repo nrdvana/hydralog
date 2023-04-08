@@ -1,6 +1,7 @@
 package HydraLog::LogReader;
 use Moo;
 use Carp;
+use POSIX 'ceil';
 
 =head1 SYNOPSIS
 
@@ -79,6 +80,8 @@ sub BUILD {
 		$self->_set_fields(\@fields);
 		$self->_set_field_defaults(\%defaults);
 		$self->_cur_ts(0);
+		$self->_index([ [ 0, ($self->fh->tell || croak "tell: $!") ] ]);
+		$self->_index_counter($self->autoindex_period);
 	}
 	else {
 		croak "Unknown format '".$self->format."'";
@@ -113,6 +116,10 @@ has timestamp_scale => ( is => 'rwp' );
 has custom_attrs    => ( is => 'rwp' );
 has level_alias     => ( is => 'lazy' );
 has _cur_ts         => ( is => 'rw' );
+has autoindex_period=> ( is => 'ro', default => 256 );
+has autoindex_size  => ( is => 'rw', default => 256 );
+has _index          => ( is => 'rw' );
+has _index_counter  => ( is => 'rw' );
 
 sub _build_level_alias {
 	{
@@ -122,7 +129,7 @@ sub _build_level_alias {
 		E  => 'ERROR',
 		W  => 'WARNING',
 		N  => 'NOTICE',
-		'' => 'INFO',
+		I  => 'INFO',
 		D  => 'DEBUG',
 		T  => 'TRACE',
 	}
@@ -135,14 +142,42 @@ sub _build_level_alias {
 Return the next record from the log file.  The records are lightweight blessed objects that
 stringify to a useful human-readable line of text.  See L</LOG RECORDS>.
 
+=head2 peek
+
+Return the next record without advancing the iteration.
+
+=head2 seek
+
+  $reader->seek($goal_epoch);
+  $reader->seek($DateTime);
+
+Seek to a unix epoch timestamp within the file so that the next record read is the first
+one with a timestamp greater or equal to the goal.  If this seeks beyond the start of the
+file the next record will be the first record of the file.  If this seeks beyond the end
+of the file the next record will be C<undef>.
+
+Dies on I/O errors.  Returns C<$reader> for convenience.
+
 =cut
 
-use constant COMMENT => ord('#');
 sub next {
 	my $self= shift;
+	defined $self->{next}? delete $self->{next} : $self->_parse_next;
+}
+
+sub peek {
+	my $self= shift;
+	defined $self->{next}? $self->{next} : ($self->{next}= $self->_parse_next);
+}
+
+use constant _COMMENT => ord('#');
+sub _parse_next {
+	my $self= shift;
+	my $file_pos= $self->{_index_counter}? undef : ($self->fh->tell || croak "tell: $!");
+	my $initial_ts= $self->{_cur_ts};
 	defined (my $line= $self->fh->getline) or return undef;
-	chomp $line;
-	redo if ord $line == COMMENT || !length $line;
+	chomp $line or return undef; # line always ends with \n, else its a partial line.
+	redo if ord $line == _COMMENT || !length $line;
 	my %rec;
 	@rec{ @{$self->fields} }= split /\t/, $line;
 	for (keys %{$self->field_defaults}) {
@@ -155,7 +190,64 @@ sub next {
 	my $l;
 	$rec{level}= $l
 		if defined $rec{level} && defined ($l= $self->level_alias->{$rec{level}});
+	# If it's time for an index entry, add one.  Test was conducted earlier.
+	if (defined $file_pos) {
+		# but wait, not if the timestamp didn't move since the previous record
+		if ($initial_ts < $self->{_cur_ts}) {
+			my $index= $self->_index;
+			if (@$index >= $self->autoindex_size) {
+				# compact index by cutting out every odd element
+				$index->[$_]= $index->[$_*2] for 1 .. int($#$index/2);
+				$#$index= int(@$index/2)-1;
+				$self->autoindex_period($self->autoindex_period * 2);
+			}
+			push @$index, [ $self->{_cur_ts}, $file_pos ];
+		}
+	} else {
+		--$self->{_index_counter}
+	}
 	bless \%rec, 'HydraLog::LogReader::Record';
+}
+
+sub seek {
+	my ($self, $goal)= @_;
+	my $goal_epoch= !ref $goal && Scalar::Util::looks_like_number($goal)? $goal
+		: ref($goal) && ref($goal)->can('epoch')? $goal->epoch
+		: croak("Can't convert '$goal' to a unix epoch");
+	my ($start, $scale)= ($self->start_epoch, $self->timestamp_scale);
+	# Is the timestamp before the first record?
+	$self->_seek_ts($goal_epoch <= $start? 0 : ceil(($goal_epoch - $start) * $scale));
+	$self;
+}
+
+sub _seek_ts {
+	my ($self, $goal_ts)= @_;
+	delete $self->{next};
+	my ($cur_ts_ref, $index)= (\$self->{_cur_ts}, $self->_index);
+	# If the goal is less or equal to the current pos, use the index and seek backward
+	if ($goal_ts <= $$cur_ts_ref) {
+		my ($min, $max)= (0, $#$index);
+		while ($min < $max) {
+			my $mid= int(($max+$min+1)/2);
+			if ($goal_ts < $index->[$mid][0]) {
+				$max= $mid-1;
+			} else {
+				$min= $mid;
+			}
+		}
+		$self->fh->seek($index->[$min][1], 0) or croak "seek: $!";
+		$self->{_index_counter}= $self->autoindex_period * (@$index - $min);
+		$$cur_ts_ref= $index->[$min][0];
+	} else {
+		# TODO: binary search forward if the file contains index comments
+	}
+	# Now read forward until the desired record
+	# TODO: read blocks and parse the steps without creating record objects
+	my $rec;
+	while ($$cur_ts_ref < $goal_ts) {
+		last unless defined ($rec= $self->_parse_next);
+	}
+	$self->{next}= $rec;
 }
 
 =head1 LOG RECORDS
@@ -256,21 +348,20 @@ package HydraLog::LogReader::Record {
 			($epoch =~ /(\.\d+)$/? $1 : '');
 	}
 
-		
 	sub to_string {
 		my $self= shift;
 		return join ' ',
-			(defined $self->{timestamp}? ( $self->timestamp_localtime ) : ()),
-			(defined $self->{level}?     ( $self->level_name ) : ()),
+			(defined $self->{timestamp}? ( $self->timestamp_local ) : ()),
+			(defined $self->{level}?     ( $self->level ) : ()),
 			(defined $self->{facility}?  ( $self->facility ) : ()),
 			(defined $self->{identity}?  ( $self->identity.':' ) : ()),
 			(defined $self->{message}?   ( $self->message ) : ());
 	}
-	
+
 	sub AUTOLOAD {
 		$HydraLog::LogReader::Record::AUTOLOAD =~ /::(\w+)$/;
 		return if $1 eq 'DESTROY' || $1 eq 'import';
-		Carp::croak("No such field $1") unless defined $_[0]{$1};
+		Carp::croak("No such field '$1'") unless defined $_[0]{$1};
 		my $field= $1;
 		no strict 'refs';
 		*{"HydraLog::LogReader::Record::$field"}= sub { $_[0]{$field} };
