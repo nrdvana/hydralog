@@ -332,18 +332,19 @@ package HydraLog::LogReader::Record {
 	sub identity  { $_[0]{identity} }
 	sub message   { $_[0]{message} }
 
+	sub timestamp_utc {
+		my $epoch= $_[0]->timestamp or return undef;
+		my ($sec, $min, $hour, $mday, $mon, $year)= gmtime $epoch;
+		return sprintf "%04d-%02d-%02dT%02d:%02d:%02d%sZ",
+			$year+1900, $mon+1, $mday, $hour, $min, $sec,
+			($epoch =~ /(\.\d+)$/? $1 : '');
+	}
+	*timestamp_iso8601= *timestamp_utc;
+
 	sub timestamp_local {
 		my $epoch= $_[0]->timestamp or return undef;
 		my ($sec, $min, $hour, $mday, $mon, $year)= localtime $epoch;
 		return sprintf "%04d-%02d-%02d %02d:%02d:%02d%s",
-			$year+1900, $mon+1, $mday, $hour, $min, $sec,
-			($epoch =~ /(\.\d+)$/? $1 : '');
-	}
-
-	sub timestamp_iso8601 {
-		my $epoch= $_[0]->timestamp or return undef;
-		my ($sec, $min, $hour, $mday, $mon, $year)= gmtime $epoch;
-		return sprintf "%04d-%02d-%02dT%02d:%02d:%02d%sZ",
 			$year+1900, $mon+1, $mday, $hour, $min, $sec,
 			($epoch =~ /(\.\d+)$/? $1 : '');
 	}
