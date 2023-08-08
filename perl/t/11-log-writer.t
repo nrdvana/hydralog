@@ -8,11 +8,10 @@ sub slurp { local $/= undef; my $fh; open $fh, '<', $_[0] and <$fh> or die $!; }
 my $t_tmp_dir= File::Temp->newdir;
 my $writer= HydraLog::LogWriter->create("$t_tmp_dir/test.log", { timestamp_scale => 100 });
 $writer->debug("debug");
-sleep .2;
 $writer->info("info");
 $writer->close;
 
-use Regexp::Debugger;
+#use Regexp::Debugger;
 like( slurp("$t_tmp_dir/test.log"),
  qr/^[#]!hydralog-dump \x20 --format=tsv0 \n
      [#] \x20 start_epoch=[.\d]+ \t timestamp_scale=100 \n
@@ -23,7 +22,6 @@ like( slurp("$t_tmp_dir/test.log"),
  'output of main writer'
 );
 
-sleep .5;
 $writer= HydraLog::LogWriter->append("$t_tmp_dir/test.log");
 $writer->error("bad stuff");
 $writer->close;
