@@ -52,12 +52,11 @@ sub BUILD {
 		CORE::open(my $fh, '<', $self->filename) or croak 'open('.$self->filename."): $!";
 		$self->_set_fh($fh);
 	}
-	my $line0= $self->fh->getline or croak "Can't read first line";
+	my $line0= $self->_next_line or croak "Can't read first line";
 	$line0 =~ /^#!.*?--format=(\w+)/ or croak "Can't parse format from first line";
 	$self->_set_format($1);
 	if ($self->format eq 'tsv0') {
-		my $line1= $self->fh->getline or croak "Can't read metadata line";
-		chomp $line1;
+		my $line1= $self->_next_line or croak "Can't read metadata line";
 		my %meta= map {
 			/^([^=]+)(?:=(.*))/ or croak "Can't parse metadata line";
 			( $1 => ($2 // 1) )
@@ -65,9 +64,8 @@ sub BUILD {
 		defined $meta{start_epoch} or croak "Metadata doesn't list start_epoch";
 		$self->_set_start_epoch(delete $meta{start_epoch});
 		$self->_set_timestamp_scale(delete $meta{ts_scale} || 1);
-		$self->_set_custom_attrs(\%meta);
-		my $line2= $self->fh->getline or croak "Can't read header line";
-		chomp $line2;
+		$self->_set_file_meta(\%meta);
+		my $line2= $self->_next_line or croak "Can't read header line";
 		my @fields;
 		my %defaults;
 		for my $fieldspec (split /\t/, substr($line2,2)) {
@@ -102,7 +100,7 @@ sub BUILD {
 
 =head2 ts_scale
 
-=head2 custom_attrs
+=head2 file_meta
 
 =cut
 
@@ -113,7 +111,7 @@ has fields          => ( is => 'rwp' );
 has field_defaults  => ( is => 'rwp' );
 has start_epoch     => ( is => 'rwp' );
 has timestamp_scale => ( is => 'rwp' );
-has custom_attrs    => ( is => 'rwp' );
+has file_meta       => ( is => 'rwp' );
 has level_alias     => ( is => 'lazy' );
 has _cur_ts         => ( is => 'rw' );
 has autoindex_period=> ( is => 'ro', default => 256 );
@@ -135,6 +133,114 @@ sub _build_level_alias {
 	}
 }
 
+has _buffer_read_size => ( is => 'ro',  default => (1<<16) );
+has _buffer_file_pos  => ( is => 'rwp', default => 0 );
+has _buffer           => ( is => 'rw',  default => '' );
+has _need_seek        => ( is => 'rw',  default => 0 );
+has _line_ends        => ( is => 'rw',  default => sub{ [] } );
+has _cur_line         => ( is => 'rw',  default => -1 );
+
+sub _next_line {
+	my $self= shift;
+	while ($self->_cur_line >= $#{ $self->_line_ends }) {
+		$self->_buffer_grow or return undef;
+	}
+	$self->_cur_line(my $cur= $self->_cur_line + 1);
+	my $start= !$cur? 0 : $self->_line_ends->[$cur-1];
+	my $end= $self->_line_ends->[$cur];
+	return substr($self->{_buffer}, $start-$self->_buffer_file_pos, $end-$start);
+}
+
+sub _prev_line {
+	my $self= shift;
+	while ($self->_buffer_file_pos > 0 && $self->_cur_line < 1) {
+		$self->_buffer_grow_reverse or return undef;
+	}
+	return undef if $self->_cur_line < 1;
+	$self->_cur_line(my $cur= $self->_cur_line - 1);
+	my $start= !$cur? 0 : $self->_line_ends->[$cur-1];
+	my $end= $self->_line_ends->[$cur];
+	return substr($self->{_buffer}, $start-$self->_buffer_file_pos, $end-$start);
+}
+
+sub _buffer_grow {
+	my $self= shift;
+	if ($self->_need_seek) {
+		my $goal= $self->_buffer_file_pos + length $self->_buffer;
+		my $arrived= sysseek($self->fh, $goal, 0) or croak "seek: $!";
+		$arrived == $goal or croak "Seek failed (arrived=$arrived, goal=$goal)";
+		$self->_need_seek(0);
+	}
+	my $got= sysread($self->fh, $self->{_buffer}, $self->_buffer_read_size, length($self->{_buffer}));
+	if (!defined $got) {
+		# temporary errors?
+		return 0 if $!{EINTR} || $!{EAGAIN} || $!{EWOULDBLOCK};
+		croak "read: $!";
+	} elsif ($got == 0) {
+		# EOF, which is permanent on non-seekable media, or maybe temporary on seekable ones.
+		$self->_need_seek(1) if $self->seekable;
+		return 0;
+	} else {
+		# Find line-ends in the new section of buffer
+		my $pos= length $self->{_buffer} - $got - 1;
+		my $ends= $self->_line_ends;
+		while (($pos= index($self->{_buffer}, "\n", $pos+1)) >= 0) {
+			push @$ends, $pos + $self->_buffer_file_pos;
+		}
+		return 1;
+	}
+}
+sub _buffer_discard {
+	my ($self, $n_bytes)= @_;
+	croak "n_bytes > length(buffer)" if $n_bytes > length($self->{_buffer});
+	substr($self->{_buffer}, 0, $n_bytes, '');
+	my $new_addr= $self->_buffer_file_pos + $n_bytes;
+	$self->_buffer_file_pos($new_addr);
+	my $ends= $self->_line_ends;
+	my $keep= 0;
+	while ($keep <= $#$ends && $ends->[$keep] < $new_addr) { $keep++ }
+	splice(@$ends, 0, $keep);
+	$self->_cur_line($self->cur_line - $keep);
+}
+
+sub _buffer_grow_reverse {
+	my $self= shift;
+	my $read_size= $self->_buffer_read_size;
+	$read_size= $self->_buffer_file_pos if $self->_buffer_file_pos < $read_size;
+	return 0 if !$read_size;
+	# Seek backwards by a read_size before start of buffer
+	my $arrived= sysseek($self->fh, $self->_buffer_file_pos - $read_size, 0) or croak "seek: $!";
+	$self->_need_seek(1); # position is not at end of buffer anymore
+	my $got= sysread($self->fh, my $buf, $read_size);
+	if (!defined $got) {
+		# temporary errors?  (probably can't happen when reading backward on seekable fh?)
+		return 0 if $!{EINTR} || $!{EAGAIN} || $!{EWOULDBLOCK};
+		croak "read: $!";
+	} elsif ($got != $read_size) {
+		# could only happen if something else truncated the file?
+		croak "Unexpected partial read while reading backward on handle";
+	} else {
+		substr($self->{_buffer}, 0, 0, $buf);
+		$self->_buffer_file_pos( $self->_buffer_file_pos - $read_size );
+		my @ends;
+		my $pos= -1;
+		while (($pos= index($buf, "\n", $pos+1)) >= 0) {
+			push @ends, $pos + $self->_buffer_file_pos;
+		}
+		splice(@{ $self->_line_ends }, 0, 0, @ends);
+		$self->_cur_line($self->cur_line + @ends);
+		return 1;
+	}
+}
+sub _buffer_discard_reverse {
+	my ($self, $n_bytes)= @_;
+	croak "n_bytes > length(buffer)" if $n_bytes > length($self->{_buffer});
+	substr($self->{_buffer}, -$n_bytes, $n_bytes, '');
+	my $ends= $self->_line_ends;
+	my $lim= $self->_buffer_file_pos + length $self->{_buffer};
+	$#$ends-- while $ends->[-1] >= $lim;
+}
+
 =head1 METHODS
 
 =head2 next
@@ -146,23 +252,11 @@ stringify to a useful human-readable line of text.  See L</LOG RECORDS>.
 
 Return the next record without advancing the iteration.
 
-=head2 seek
-
-  $reader->seek($goal_epoch);
-  $reader->seek($DateTime);
-
-Seek to a unix epoch timestamp within the file so that the next record read is the first
-one with a timestamp greater or equal to the goal.  If this seeks beyond the start of the
-file the next record will be the first record of the file.  If this seeks beyond the end
-of the file the next record will be C<undef>.
-
-Dies on I/O errors.  Returns C<$reader> for convenience.
-
 =cut
 
 sub next {
 	my $self= shift;
-	defined $self->{next}? delete $self->{next} : $self->_parse_next;
+	$self->{cur}= defined $self->{next}? delete $self->{next} : $self->_parse_next;
 }
 
 sub peek {
@@ -173,11 +267,10 @@ sub peek {
 use constant _COMMENT => ord('#');
 sub _parse_next {
 	my $self= shift;
-	my $file_pos= $self->{_index_counter}? undef : ($self->fh->tell || croak "tell: $!");
 	my $initial_ts= $self->{_cur_ts};
-	defined (my $line= $self->fh->getline) or return undef;
-	chomp $line or return undef; # line always ends with \n, else its a partial line.
+	defined (my $line= $self->_next_line) or return undef;
 	redo if ord $line == _COMMENT || !length $line;
+	my $file_pos= $self->{_index_counter}? undef : $self->_line_ends->[$self->_cur_line]+1;
 	my %rec;
 	@rec{ @{$self->fields} }= split /\t/, $line;
 	for (keys %{$self->field_defaults}) {
@@ -208,6 +301,21 @@ sub _parse_next {
 	}
 	bless \%rec, 'HydraLog::LogReader::Record';
 }
+
+=head2 seek
+
+  $reader->seek($goal_epoch);
+  $reader->seek($DateTime);
+
+Seek to a unix epoch timestamp within the file so that the next record read is the first
+one with a timestamp greater or equal to the goal.  If this seeks beyond the start of the
+file the next record will be the first record of the file.  If this seeks beyond the end
+of the file the next record will be C<undef>, but you can call L</prev> to get the record
+before end of file.
+
+Dies on I/O errors.  Returns C<$reader> for convenience.
+
+=cut
 
 sub seek {
 	my ($self, $goal)= @_;
@@ -248,6 +356,22 @@ sub _seek_ts {
 		last unless defined ($rec= $self->_parse_next);
 	}
 	$self->{next}= $rec;
+}
+
+sub seek_last {
+	my ($self)= @_;
+	# TODO: If the file contains index comments, read blacks backward until the
+	# first index point.
+	if (0) {
+	} else {
+		# Are we at the end of the file already?
+		my $next= $self->_parse_next;
+		if (!$next) {
+			# need to rewind to last index point and walk forward again.
+			$self->_seek_ts(
+		# Else take the last known auto-index and iterate forward.
+		if ($self->_index && @{ $self->_index } && $self->{_cur_ts}
+	}
 }
 
 =head1 LOG RECORDS
