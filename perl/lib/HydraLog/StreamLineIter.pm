@@ -87,83 +87,58 @@ Boolean, whether C<fh> is seekable.
 
 Byte offset where the first line begins (in case there is a header to ignore)
 
-=head2 buffer_addr
-
-Address of beginning of buffer
-
-=head2 buffer_len
-
-Number of bytes buffered
-
 =head2 line_addr
 
-Address of the I<start> of the most recent line returned from either L</next> or L</prev>.
+Address of the I<start> of the most recent line returned from L</next>, L</prev>, or L</seek>.
 
 =cut
 
-has fh                  => ( is => 'ro' );
-has seekable            => ( is => 'rwp' );
-has first_line_addr     => ( is => 'rwp' );
-has buffer_addr         => ( is => 'rwp' );
-sub buffer_len {
-	my $n= 0;
-	$n += length $$_ for @{ $_[0]->_buffers };
-	return $n;
-}
-has line_addr           => ( is => 'rw' );
+has fh                   => ( is => 'ro' );
+has seekable             => ( is => 'rwp' );
+has first_line_addr      => ( is => 'rwp' );
+has line_addr            => ( is => 'rw' );
 
 # The buffer format used by this module is an arrayref of scalar refs, each
 # limited to 'buf_size' (unless it was provided by the user in which case it
 # is as big as they gave us)
-has _buffer_chunk_size  => ( is => 'rw', default => (1<<16) };
-has _buffer_addr        => ( is => 'rw' );
-has _buffers            => ( is => 'rw', default => sub {[]} );
-has _need_seek          => ( is => 'rw', default => 0 );
-has _line_addrs         => ( is => 'rw', default => sub{ [] } );
-has _line_idx           => ( is => 'rw', default => -1 );
+has _buffer_addr         => ( is => 'rw' );
+sub _buffer_len {
+	my $bufs= $_[0]->_buffers;
+	return !@$bufs? 0
+		: $_[0]->_buffer_chunk_size * $#$bufs + length ${$bufs->[-1]};
+}
+has _buffer_chunk_size   => ( is => 'rw', default => (1<<16) );
+has _buffers             => ( is => 'rw', default => sub {[]} );
+has _file_pos            => ( is => 'rw', default => 0 );
+has _line_addr_cache     => ( is => 'rw', default => sub {[]} );
+has _line_addr_cache_max => ( is => 'rw', default => 16 );
+has _line_addr_cache_idx => ( is => 'rw', default => undef );
 
 sub BUILD {
 	my ($self, $args)= @_;
 	defined $self->fh or defined $args->{buffer}
 		or croak "Require 'fh' or 'buffer'";
-	my $file_addr= defined $self->fh? sysseek($self->fh, 0, 1) : undef;
-	my $blen;
-	if (defined $args->{buffer}) {
-		# this is either the entire contents of the input, or a leading piece of the
-		# input to seed the cache.  It is assumed that the file handle is positioned
-		# at the end of the data read into this buffer.
-		$self->_buffers->[0]= ref $args->{buffer}? $args->{buffer}
-			: do { my $x= $args->{buffer}; \$x; };
-		# Buffers are allocated in _buffer_chunk_size pieces, so if this one if larger
-		# than that, the chunk size needs enlarged, or this needs split into pieces.
-		# Enlarging the chunk size is the cheaper operation.
-		$blen= length ${$self->_buffers->[0]};
-		$self->_buffer_chunk_size(($blen | 0x3FF) & ~0x3FF)
-			if $blen > $self->_buffer_chunk_size;
+	my $file_addr= defined $self->fh? sysseek($self->fh, 0, 1)
+		: undef;
+	$self->_set_seekable(defined $file_addr)
+		unless defined $self->seekable;
+	if (!$self->fh && defined $args->{buffer}) {
+		@{$self->_buffers}= ref $args->{buffer}? $args->{buffer} : \$args->{buffer};
+		$self->_buffer_chunk_size(length $args->{buffer});
 	}
+	my $blen;
 	if (!defined $self->first_line_addr) {
-		$self->first_line_addr(
+		$self->_set_first_line_addr(
 			# not seekable, doesn't matter
 			!defined $file_addr? 0
-			# Assume file has been read into buffer, and file pointer is at end of buffer
-			: defined $args->{buffer} && $file_addr >= $self->buffer_len?
-				$file_addr - $self->buffer_len
 			# Assume file pointer is at first line
 			: $file_addr
 		);
 	}
-	$self->_set_buffer_addr($self->first_line_addr)
-		unless defined $self->buffer_addr;
-	$self->_set_seekable(defined $file_addr)
-		unless defined $self->seekable;
-	if ($blen) {
-		my ($pos, $buf, $bufaddr, @addrs)= (-1, $self->_buffers->[0], $self->buffer_addr);
-		push @addrs, 0 if $bufaddr == $self->first_line_addr;
-		while (($pos= index($$buf, "\n", $pos+1)) >= 0) {
-			push @addrs, $bufaddr + $pos + 1;
-		}
-		$self->_line_addrs(\@addrs);
-	}
+	$self->_buffer_addr(!defined $file_addr? 0
+		: $file_addr - $file_addr % $self->_buffer_chunk_size
+	);
+	$self->_file_pos($file_addr || 0);
 }
 
 =head1 METHODS
@@ -191,59 +166,78 @@ This updates L</line_addr> if it succeeds.
 
 sub next {
 	my $self= shift;
-	while ($self->_line_idx + 1 >= $#{ $self->_line_addrs }) {
-		$self->_load_next or return undef;
+	my $linecache= $self->_line_addr_cache; # ref doesn't change
+	my $idx= $self->_line_addr_cache_idx;
+	if (!@$linecache) {
+		# begin iteration from first_line_addr
+		my $first_nl= $self->_find_next_nl($self->first_line_addr);
+		defined $first_nl or return undef;
+		@$linecache= ( $self->first_line_addr, $first_nl+1 );
+		$idx= 0;
 	}
-	my $idx= $self->_line_idx + 1;
-	$self->_line_idx($idx);
-	return $self->_get_line($idx);
+	# linecache is initialized, so will have at least 2 entries,
+	# idx (start) and idx+1 (end), but need to add another if idx+2 doesn't exist.
+	elsif ($idx + 2 <= $#$linecache) {
+		++$idx;
+	}
+	else {
+		my $next_nl= $self->_find_next_nl($linecache->[$idx+1]);
+		defined $next_nl or return undef;
+		push @$linecache, $next_nl + 1;
+		# line_addr_cache gained an entry.  Check if one needs removed.
+		if (@$linecache > $self->_line_addr_cache_max) {
+			shift @$linecache;
+		} else {
+			++$idx;
+		}
+	}
+	$self->_line_addr_cache_idx($idx);
+	return $self->_get_line($linecache->[$idx], $linecache->[$idx+1]-1);
 }
 
 sub prev {
 	my $self= shift;
-	while ($self->_line_idx < 1) {
-		$self->_load_prev or return undef;
-		# successful load will change _line_idx if it found new lines
+	my $linecache= $self->_line_addr_cache; # ref doesn't change
+	my $idx= $self->_line_addr_cache_idx;
+	if (!@$linecache) {
+		# begin iteration from end of file, if seekable, or fully loaded in buffer
+		my $file_addr;
+		if ($self->seekable) {
+			$file_addr= sysseek($self->fh, 0, 2) or return undef;
+		} elsif (!$self->fh) {
+			$file_addr= $self->_buffer_len;
+		} else {
+			return undef;
+		}
+		my $last_nl= $self->_find_prev_nl($file_addr-1);
+		defined $last_nl or return undef;
+		my $prev_nl= $self->_find_prev_nl($last_nl-1);
+		defined $prev_nl or return undef;
+		@$linecache= ( $prev_nl + 1, $last_nl + 1 );
+		$idx= 0;
 	}
-	my $idx= $self->_line_idx - 1;
-	$self->_line_idx($idx);
-	return $self->_get_line($idx);
-}
-
-sub _get_line {
-	my ($self, $idx)= @_;
-	$idx >= 0 && $idx < $#{ $self->_line_addrs }
-		or die "BUG: idx $idx out of bounds";
-	my $line_addr0= $self->_line_addrs->[$idx];
-	my $line_addr1= $self->_line_addrs->[$idx+1] - 1;
-	my $buf_ofs0= $line_addr0 - $self->buffer_addr;
-	my $buf_ofs1= $line_addr1 - $self->buffer_addr;
-	$buf_ofs0 >= 0 && $buf_ofs1 < @{$self->_buffers}
-		or die "BUG: buf_ofs $buf_ofs out of bounds";
-	my $mod= $self->_buffer_chunk_size;
-	my $buf_idx0= int($buf_ofs0 / $mod);
-	$buf_ofs0 -= $buf_idx0 * $mod;
-	my $buf_idx1= int($buf_ofs1 / $mod);
-	$buf_ofs1 -= $buf_idx1 * $mod;
-	$self->line_addr($line_addr0);
-	return substr(${$self->_buffers->[$buf_idx0]}, $buf_ofs0, $buf_ofs1-$buf_ofs0)
-		if $buf_idx0 == $buf_idx1;
-	# The line is split across one or more buffers
-	my $ret= substr(${$self->_buffers->[$buf_idx0]}, $buf_ofs0);
-	$ret .= ${$self->_buffers->[$_]} for (($buf_idx0+1)..($buf_idx1-1));
-	return $ret .= substr(${$self->_buffers->[$buf_idx1]}, 0, $buf_ofs1);
+	# linecache is initialized, so will have at least 2 entries,
+	# idx (start) and idx+1 (end), but need to add another if idx-1 doesn't exist.
+	elsif ($idx > 0) {
+		--$idx;
+	}
+	else {
+		my $prev_nl= $self->_find_prev_nl($linecache->[$idx]-2);
+		defined $prev_nl or return undef;
+		unshift @$linecache, $prev_nl + 1;
+		# line_addr_cache gained an entry.  Check if one needs removed.
+		pop @$linecache if @$linecache > $self->_line_addr_cache_max;
+	}
+	$self->_line_addr_cache_idx($idx);
+	return $self->_get_line($linecache->[$idx], $linecache->[$idx+1]-1);
 }
 
 =head2 seek
 
   $line= $lineiter->seek($file_addr);
 
-Return the line containing the C<$file_addr>.  Calling seek may reset the buffers, unless the
-address is within one block of the existing buffers in which case they will grow to include the
-address.
-
-If there is a line at this address, it returns the line and updates L</line_addr>.  Else it
-returns undef.
+If there is a line at this address, and seeking and loading the relevant blocks succeeds, it
+returns the line and updates L</line_addr>.  Else it returns undef.
 
 =cut
 
@@ -251,134 +245,189 @@ sub seek {
 	my ($self, $addr)= @_;
 	# Check for beginning of file
 	return undef if $addr < $self->first_line_addr;
-	my $mod= $self->_buffer_chunk_size;
-	my $lines= $self->_line_addrs;
-	# Is the address more than one block before the current start, or more than one
-	# block after the end of the buffer? (and only if we can seek there)
-	if ($self->seekable and (
-		$addr < $self->_buffer_addr - $mod
-		|| $addr > $self->_buffer_addr + (1+@{$self->_buffers})*$mod)
-	) {
-		# seek to desired block and then reset buffers
-		my $block_addr= $addr - $addr % $mod;
-		my $arrived= sysseek($self->fh, $block_addr, 0)
-			or return undef;
-		$self->_buffer_addr($block_addr);
-		my $buf;
-		@{ $self->_buffers }= (\$buf);
-		$self->_need_seek(1);
-		@$lines= ();
-		$self->_line_idx(0);
-		my $got= sysread($self->fh, $buf, $mod);
-		return undef unless defined $got;
-		my ($pos, $addrs)= (-1, $self->_line_addrs);
-		push @$lines, 0 if $block_addr == $self->first_line_addr;
-		while (($pos= index($buf, "\n", $pos+1)) >= 0) {
-			push @$lines, $block_addr + $pos + 1;
+	# can we load it?  (might just use cache)
+	$self->_load_addr($addr) or return undef;
+	# Is the addr within the known lines?
+	my $linecache= $self->_line_addr_cache; # ref doesn't change
+	if (@$linecache && $linecache->[0] <= $addr && $addr < $linecache->[-1]) {
+		# Binary search
+		my ($min, $max)= (0, $#$linecache);
+		while ($min < $max) {
+			my $mid= ($min+$max+1)>>1;
+			if ($addr < $linecache->[$mid]) {
+				$max= $mid-1;
+			} else {
+				$min= $mid;
+			}
+		}
+		if ($min == $max) {
+			$self->_line_addr_cache_idx($min);
+			return $self->_get_line($linecache->[$min], $linecache->[$min+1]-1);
 		}
 	}
-	# Iterate forward or backward until we've found a line that includes $addr.
-	# (line could be longer than one buffer, so this may iterate a few times)
-	while (!@$lines || $addr < $lines->[0]) {
-		$self->_buffer_grow_reverse or return undef;
-	}
-	while ($addr > $lines->[-1]) {
-		$self->_buffer_grow or return undef;
-	}
-	# Binary search, in case there are lots of lines.
-	my ($min, $max)= (0, $#$lines);
-	while ($min < $max) {
-		my $mid= ($min+$max+1)>>1;
-		if ($addr < $lines->[$mid]) {
-			$max= $mid-1;
-		} else {
-			$min= $mid;
-		}
-	}
-	return undef unless $min == $max && $min < $#$lines;
-	$self->_line_idx($min);
-	return $self->_get_line($min);
-}
+	# Seek backward and forward to find bounding newline chars
+	my $prev_nl= $self->_find_prev_nl($addr-1);
+	my $next_nl= $self->_find_next_nl($addr);
+	return undef unless defined $prev_nl && defined $next_nl;
+
+	@$linecache= ( $prev_nl+1, $next_nl+1 );
+	$self->_line_addr_cache_idx(0);
+	return $self->_get_line($linecache->[0], $linecache->[1]-1);
+}	
 
 =head2 release_before
 
   $lineiter->release_before($file_address);
 
 Release buffers up to C<$file_address>.  This only releases whole buffer chunks, and has no
-effect if C<$file_address> is in the first (or only) chunk.
+effect if C<$file_address> is in the first (or only) chunk.  It will also not release the
+block containing the current line.
 
 =head2 release_after
 
   $lineiter->release_after($file_address);
 
 Release buffers after C<$file_address>.  This only releases whole buffer chunks, and has no
-effect if C<$file_address> is in the last (or only) chunk.
+effect if C<$file_address> is in the last (or only) chunk.  It will also not release the
+block containing the current line.
 
 =cut
 
-sub release_before {
-	my ($self, $addr)= @_;
-	my $buf_idx= int(($addr - $self->buffer_addr) / $self->_buffer_chunk_size);
-	return 0 unless $buf_idx > 0 && $buf_idx <= $#{ $self->_buffers };
+#sub release_before {
+#	my ($self, $addr)= @_;
+#	# don't release the buffer holding the current line
+#	$addr= $self->line_addr if defined $self->line_addr && $addr > $self->line_addr;
+#	my $buf_idx= int(($addr - $self->buffer_addr) / $self->_buffer_chunk_size);
+#	return 0 unless $buf_idx > 0 && $buf_idx <= $#{ $self->_buffers };
+#
+#	splice(@{$self->_buffers}, 0, $buf_idx);
+#	my $new_addr= $self->buffer_addr + $buf_idx * $self->_buffer_chunk_size;
+#	$self->_set_buffer_addr($new_addr);
+#	my $lines= $self->_line_addrs;
+#	my $keep_idx= 0;
+#	$keep_idx++ while $keep_idx <= $#$lines && $lines->[$keep_idx] < $new_addr;
+#	if ($keep_idx > 0) {
+#		splice(@$lines, 0, $keep_idx);
+#		# adjust the line_idx by how many elements were removed.
+#		$self->_line_idx($self->_line_idx - $keep_idx);
+#	}
+#	return 1;
+#}
+#
+#sub release_after {
+#	my ($self, $addr)= @_;
+#	# Releasing forward prevents growing the buffers, unless the stream is seekable.
+#	return 0 unless $self->seekable;
+#
+#	# don't release the buffer holding the current line
+#	$addr= $self->line_addr if defined $self->line_addr && $addr < $self->line_addr;
+#	my $buf_idx= int(($addr - $self->buffer_addr) / $self->_buffer_chunk_size);
+#	return 0 unless $buf_idx >= 0 && $buf_idx < $#{ $self->_buffers };
+#
+#	splice(@{$self->_buffers}, $buf_idx+1);
+#	my $end_addr= $self->buffer_addr + $buf_idx * $self->_buffer_chunk_size
+#		+ length ${$self->_buffers->[$buf_idx]};
+#	my $lines= $self->_line_addrs;
+#	$#$lines-- while $#$lines > 0 && $lines->[-1] > $end_addr;
+#	# The file position no longer matches the end of the buffers, so seek is needed
+#	$self->_need_seek(1);
+#	return 1;
+#}
 
-	splice(@{$self->_buffers}, 0, $buf_idx);
-	my $new_addr= $self->buffer_addr + $buf_idx * $self->_buffer_chunk_size;
-	$self->buffer_addr($new_addr);
-	my $lines= $self->_line_addrs;
-	my $keep_idx= 0;
-	$keep_idx++ while $keep_idx <= $#$lines && $lines->[$keep_idx] < $new_addr;
-	if ($keep_idx > 0) {
-		splice(@$lines, 0, $keep_idx);
-		# adjust the line_idx by how many elements were removed.
-		$self->_line_idx($self->_line_idx - $keep_idx);
+sub _get_line {
+	my ($self, $addr0, $addr1)= @_;
+	--$addr1; # this points to the newline.  Change it to point to the final char.
+	my $bs= $self->_buffer_chunk_size;
+	# Verify that the buffer chunks are loaded for this range
+	if ($addr0 < $self->_buffer_addr || $addr1 > $self->_buffer_addr + $self->_buffer_len) {
+		$self->_load_addr($_ * $bs) or return undef
+			for int($addr0 / $bs) .. int($addr1 / $bs);
+		$self->_load_addr($addr1) or return undef;
 	}
-	return 1;
+	my $buf0_idx= int(($addr0 - $self->_buffer_addr) / $bs);
+	my $buf1_idx= int(($addr1 - $self->_buffer_addr) / $bs);
+	my $buf0_ofs= $addr0 % $bs;
+	my $buf1_ofs= $addr1 % $bs;
+	$self->line_addr($addr0); # let user know address of last returned line
+	# single substr if start and end in same buffer
+	return substr(${$self->_buffers->[$buf0_idx]}, $buf0_ofs, $buf1_ofs-$buf0_ofs+1)
+		if $buf0_idx == $buf1_idx;
+	# The line is split across one or more buffers
+	my $ret= substr(${$self->_buffers->[$buf0_idx]}, $buf0_ofs);
+	$ret .= ${$self->_buffers->[$_]} for +($buf0_idx+1) .. ($buf1_idx-1);
+	return $ret .= substr(${$self->_buffers->[$buf1_idx]}, 0, $buf1_ofs+1);
 }
 
-sub release_after {
+sub _find_next_nl {
 	my ($self, $addr)= @_;
-	# Releasing forward prevents growing the buffers, unless the stream is seekable.
-	return 0 unless $self->seekable;
-
-	my $buf_idx= int(($addr - $self->buffer_addr) / $self->_buffer_chunk_size);
-	return 0 unless $buf_idx >= 0 && $buf_idx < $#{ $self->_buffers };
-
-	splice(@{$self->_buffers}, $buf_idx+1);
-	my $end_addr= $self->buffer_addr + $buf_idx * $self->_buffer_chunk_size
-		+ length ${$self->_buffers->[$buf_idx]};
-	my $lines= $self->_line_addrs;
-	$#$lines-- while $#$lines > 0 && $lines->[-1] > $end_addr;
-	# The file position no longer matches the end of the buffers, so seek is needed
-	$self->_need_seek(1);
-	return 1;
+	my $bs= $self->_buffer_chunk_size;
+	while (1) {
+		my $buf_idx= int(($addr - $self->_buffer_addr) / $bs);
+		my $pos= $addr % $bs;
+		# if this address isn't loaded, load it.
+		while ($buf_idx < 0 || $buf_idx >= @{$self->_buffers} || $pos >= length ${$self->_buffers->[$buf_idx]}) {
+			$self->_load_addr($addr) or return undef;
+			# buffer_addr may have changed
+			$buf_idx= int(($addr - $self->_buffer_addr) / $bs);
+		}
+		# Scan through newly-read bytes
+		my $found= index(${$self->_buffers->[$buf_idx]}, "\n", $pos);
+		if ($found >= 0) {
+			$addr += $found - $pos;
+			last;
+		} else {
+			$addr += length ${$self->_buffers->[$buf_idx]} - $pos;
+		}
+	}
+	return $addr;
 }
 
-sub _load_next {
-	my $self= shift;
-	my $mod= $self->_buffer_chunk_size;
-	# Is there a partial buffer to fill?
-	my ($buf_addr, $bufref, $got, $lines);
-	if (@{$self->_buffers} && length ${$self->_buffers->[-1]} < $mod) {
-		$buf_addr= $self->_buffer_addr + $#{$self->_buffers} * $mod;
-		$bufref= $self->_buffers->[-1];
-		$lines= $self->_line_addrs->[-1];
-	} else {
-		$buf_addr= $self->_buffer_addr + @{$self->_buffers} * $mod;
-		$bufref= \my $buf;
-		$lines= [];
-		# The buffer begins a new line if it is the first buffer,
-		# or if the last character in the previous buffer was "\n".
-		push @$lines, 0 if $buf_addr == $self->first_line_addr
-			or @{$self->_line_addrs} && @{$self->_line_addrs->[-1]}
-				&& $self->_line_addrs->[-1][-1] == $mod;
+sub _find_prev_nl {
+	my ($self, $addr)= @_;
+	my $bs= $self->_buffer_chunk_size;
+	while ($addr > $self->first_line_addr) {
+		my $buf_idx= int(($addr - $self->_buffer_addr) / $bs);
+		my $pos= $addr % $bs;
+		# if this address isn't loaded, load it.
+		while ($buf_idx < 0 || $buf_idx >= @{$self->_buffers} || $pos >= length ${$self->_buffers->[$buf_idx]}) {
+			$self->_load_addr($addr) or return undef;
+			# buffer_addr may have changed
+			$buf_idx= int(($addr - $self->_buffer_addr) / $bs);
+		}
+		# Scan through newly-read bytes
+		my $found= rindex(${$self->_buffers->[$buf_idx]}, "\n", $pos);
+		if ($found >= 0) {
+			$addr -= $pos - $found;
+			last;
+		} else {
+			$addr -= $pos + 1;
+		}
 	}
-	if ($self->_need_seek) {
-		my $goal= $buf_addr + length $$bufref;
-		my $arrived= sysseek($self->fh, $goal, 0) or croak "seek: $!";
-		$arrived == $goal or croak "Seek failed (arrived=$arrived, goal=$goal)";
-		$self->_need_seek(0);
+	return $addr >= $self->first_line_addr? $addr : $self->first_line_addr - 1;
+}
+
+sub _load_addr {
+	my ($self, $addr)= @_;
+	my $bs= $self->_buffer_chunk_size;
+	my $buf_idx= int( ($addr - $self->_buffer_addr) / $bs);
+	my $buf_ofs= $addr % $bs;
+	# already loaded?
+	return 1 if $buf_idx >= 0 && $buf_idx <= $#{$self->_buffers}
+		&& $buf_ofs < length ${$self->_buffers->[$buf_idx]};
+	# Trying to fill an existing partial buffer?
+	my $bufref= ($buf_idx < 0 || $buf_idx > $#{$self->_buffers})
+		? \(my $buf= '')
+		: $self->_buffers->[-1];
+	my $seek_addr= $self->_buffer_addr + $buf_idx * $bs + length($$bufref);
+	if ($seek_addr != $self->_file_pos) {
+		return undef unless $self->seekable;
+		my $arrived= sysseek($self->fh, $seek_addr, 0);
+		defined $arrived or do { carp "seek: $!"; return undef; };
+		$arrived == $seek_addr or do { carp "seek arrived at wrong address"; return undef; };
+		$self->_file_pos($seek_addr);
 	}
-	$got= sysread($self->fh, $$bufref, $mod - length($$bufref), length($$bufref));
+	my $got= sysread($self->fh, $$bufref, $bs-length($$bufref), length($$bufref));
+	$self->_file_pos($seek_addr + $got) if $got;
 	if (!defined $got) {
 		# temporary errors?
 		return 0 if $!{EINTR} || $!{EAGAIN} || $!{EWOULDBLOCK};
@@ -386,47 +435,20 @@ sub _load_next {
 	} elsif ($got == 0) {
 		# EOF, which is permanent on non-seekable media, or maybe temporary on seekable ones.
 		$self->_set_eof(1);
-		$self->_need_seek(1) if $self->seekable;
 		return 0;
-	} else {
-		# Find line-ends in the new section of buffer
-		my $pos= length $$bufref - $got - 1;
-		while (($pos= index($$bufref, "\n", $pos+1)) >= 0) {
-			push @$lines, $pos;
-		}
-		# If the 
-		return 1;
+	} elsif ($buf_idx == -1) {
+		# Must read a full block, else we'd have a hole in the buffer
+		return undef unless $got == $bs;
+		unshift @{$self->_buffers}, $bufref;
+		$self->_buffer_addr($self->_buffer_addr - $bs);
+	} elsif ($buf_idx == @{$self->_buffers}) {
+		push @{$self->_buffers}, $bufref;
+	} elsif ($buf_idx < -1 || $buf_idx > @{$self->_buffers}) {
+		# reset the cache
+		@{$self->{_buffers}}= ( $bufref );
+		$self->_buffer_addr($self->_buffer_addr + $buf_idx * $bs);
 	}
-}
-
-sub _load_prev {
-	my $self= shift;
-	my $read_size= $self->_buffer_read_size;
-	$read_size= $self->_buffer_file_pos if $self->_buffer_file_pos < $read_size;
-	return 0 if !$read_size;
-	# Seek backwards by a read_size before start of buffer
-	my $arrived= sysseek($self->fh, $self->_buffer_file_pos - $read_size, 0) or croak "seek: $!";
-	$self->_need_seek(1); # position is not at end of buffer anymore
-	my $got= sysread($self->fh, my $buf, $read_size);
-	if (!defined $got) {
-		# temporary errors?  (probably can't happen when reading backward on seekable fh?)
-		return 0 if $!{EINTR} || $!{EAGAIN} || $!{EWOULDBLOCK};
-		croak "read: $!";
-	} elsif ($got != $read_size) {
-		# could only happen if something else truncated the file?
-		croak "Unexpected partial read while reading backward on handle";
-	} else {
-		substr($self->{_buffer}, 0, 0, $buf);
-		$self->_buffer_file_pos( $self->_buffer_file_pos - $read_size );
-		my @ends;
-		my $pos= -1;
-		while (($pos= index($buf, "\n", $pos+1)) >= 0) {
-			push @ends, $pos + $self->_buffer_file_pos;
-		}
-		splice(@{ $self->_line_ends }, 0, 0, @ends);
-		$self->_cur_line($self->cur_line + @ends);
-		return 1;
-	}
-}
+	return $got;
+}	
 
 1;
