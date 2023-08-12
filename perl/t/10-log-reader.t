@@ -17,7 +17,7 @@ END
 			call 'format' => 'tsv0';
 			call start_epoch => $y2020;
 			call timestamp_scale => 1;
-			call custom_attrs => { example => 'true' };
+			call file_meta => { example => 'true' };
 			call fields => [qw( timestamp_step_hex level message )],
 		},
 		'reader object'
