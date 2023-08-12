@@ -136,6 +136,51 @@ sub put {
 		for 0..$#_;
 }
 
+=head2 clear
+
+  $sa->clear(); # all
+  $sa->clear($index); # one
+  $sa->clear($index, $count); # range
+
+Clear contents of a range of the array.  If this range includes the L</min> or L</max>
+positions, the logical range will be shortened as well.  Or in other words, if the range
+is somewhere in the middle of (L</min>..L</max>), C<min> and C<max> will be unchanged.
+
+This does not cause any elements to shift position.
+
+=cut
+
+sub clear {
+	my ($self, $min, $count)= @_;
+	my $buf= $self->_buf;
+	my $pos= $self->_pos;
+	my $lim;
+	if (!defined $min) {
+		$min= $self->_min;
+		$lim= $self->_lim;
+	} else {
+		$min += $pos;
+		$lim= $min + (defined $count? $count : 1);
+		$min= $self->_min if $min < $self->_min;
+		$lim= $self->_lim if $lim > $self->_lim;
+	}
+	if ($min < $lim) {
+		$buf->[ $_ & $#$buf ]= undef
+			for $min..($lim-1);
+		if ($self->_min == $min) {
+			if ($self->_lim == $lim) {
+				# simplify the min/lim if there are no elements left.
+				$self->_min($self->_pos);
+				$self->_lim($self->_pos);
+			} else {
+				$self->_min($lim);
+			}
+		} elsif ($self->_lim == $lim) {
+			$self->_lim($min);
+		}
+	}
+}
+
 =head2 slide
 
   $sa->slide($offset);

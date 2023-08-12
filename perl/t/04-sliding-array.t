@@ -120,4 +120,58 @@ subtest multiput_multiget => sub {
 	}, 'write 3 beyond existing' );
 };
 
+subtest clear => sub {
+	my $buf= HydraLog::SlidingArray->new(size => 8);
+	$buf->put(-3, -3, -2, -1, 0, 1, 2, 3, 4);
+	$buf->clear(-3, 3);
+	is( $buf, object {
+		call min => 0;
+		call max => 4;
+		call count => 5;
+	}, 'clear from left' );
+
+	$buf->put(-3, -3, -2, -1, 0, 1, 2, 3, 4);
+	$buf->clear(-10, 8);
+	is( $buf, object {
+		call min => -2;
+		call max => 4;
+		call count => 7;
+	}, 'clear overlap left' );
+
+	$buf->put(-3, -3, -2, -1, 0, 1, 2, 3, 4);
+	$buf->clear(3, 2);
+	is( $buf, object {
+		call min => -3;
+		call max => 2;
+		call count => 6;
+	}, 'clear from right' );
+	
+	$buf->put(-3, -3, -2, -1, 0, 1, 2, 3, 4);
+	$buf->clear(1, 10);
+	is( $buf, object {
+		call min => -3;
+		call max => 0;
+		call count => 4;
+	}, 'clear overlap right' );
+
+	$buf->put(-3, -3, -2, -1, 0, 1, 2, 3, 4);
+	$buf->clear(0, 2);
+	is( $buf, object {
+		call min => -3;
+		call max => 4;
+		call count => 8;
+		call [ get => -1 ], -1;
+		call [ get =>  0 ], undef;
+		call [ get =>  1 ], undef;
+		call [ get =>  2 ], 2;
+	}, 'clear middle' );
+
+	$buf->clear;
+	is( $buf, object {
+		call min => 0;
+		call max => -1;
+		call count => 0;
+	}, 'clear all' );
+};
+
 done_testing;
