@@ -27,6 +27,13 @@ subtest read_forward_mem => sub {
 	is( $it->next, undef );
 };
 
+subtest read_forward_seekable => sub {
+	open my $fh, '<:raw', \$text or die "open: $!";
+	my $it= HydraLog::StreamLineIter->new_seekable($fh);
+	is( $it->next, "Line 1" );
+	is( $it->next, "Line 2" );
+};
+
 subtest read_backward_mem => sub {
 	my $it= HydraLog::StreamLineIter->new_static(\$text);
 	is( $it->prev, "" ) for 1..3;

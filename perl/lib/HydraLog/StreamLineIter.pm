@@ -95,9 +95,12 @@ Address of the I<start> of the most recent line returned from L</next>, L</prev>
 =cut
 
 has fh                    => ( is => 'ro' );
+has eof                   => ( is => 'rwp' );
 has seekable              => ( is => 'rwp' );
+has use_sysread           => ( is => 'rwp' );
 has first_line_addr       => ( is => 'rwp' );
-has line_addr             => ( is => 'rw' );
+has line_addr             => ( is => 'rwp' );
+has next_line_addr        => ( is => 'rwp' );
 has line_addr_cache_size  => ( is => 'rw', default => 1024 );
 
 # The buffer format used by this module is an arrayref of scalar refs, each
@@ -122,6 +125,8 @@ sub BUILD {
 		: undef;
 	$self->_set_seekable(defined $file_addr)
 		unless defined $self->seekable;
+	$self->_set_use_sysread($self->fh && fileno($self->fh) >= 0)
+		unless defined $self->use_sysread;
 	if (!$self->fh && defined $args->{buffer}) {
 		@{$self->_buffers}= ref $args->{buffer}? $args->{buffer} : \$args->{buffer};
 		$self->_buffer_chunk_size(length ${$self->_buffers->[0]});
@@ -335,7 +340,8 @@ sub _get_line {
 	my $buf1_idx= int(($addr1 - $self->_buffer_addr) / $bs);
 	my $buf0_ofs= $addr0 % $bs;
 	my $buf1_ofs= $addr1 % $bs;
-	$self->line_addr($addr0); # let user know address of last returned line
+	$self->_set_line_addr($addr0); # let user know address of last returned line
+	$self->_set_next_line_addr($addr1+2);
 	# single substr if start and end in same buffer
 	return substr(${$self->_buffers->[$buf0_idx]}, $buf0_ofs, $buf1_ofs-$buf0_ofs+1)
 		if $buf0_idx == $buf1_idx;
@@ -408,17 +414,24 @@ sub _load_addr {
 	my $seek_addr= $self->_buffer_addr + $buf_idx * $bs + length($$bufref);
 	if ($seek_addr != $self->_file_pos) {
 		return undef unless $self->seekable;
-		my $arrived= sysseek($self->fh, $seek_addr, 0);
-		defined $arrived or do { carp "seek: $!"; return undef; };
-		$arrived == $seek_addr or do { carp "seek arrived at wrong address"; return undef; };
+		if ($self->use_sysread) {
+			my $arrived= sysseek($self->fh, $seek_addr, 0);
+			defined $arrived or do { warn "seek: $!"; return undef; };
+			$arrived == $seek_addr or do { warn "seek arrived at wrong address"; return undef; };
+		} else {
+			$self->fh->seek($seek_addr, 0)
+				or do { carp "seek: $!"; return undef; };
+		}
 		$self->_file_pos($seek_addr);
 	}
-	my $got= sysread($self->fh, $$bufref, $bs-length($$bufref), length($$bufref));
+	my $got= $self->use_sysread
+		? sysread($self->fh, $$bufref, $bs-length($$bufref), length($$bufref))
+		: $self->fh->read($$bufref, $bs-length($$bufref), length($$bufref));
 	$self->_file_pos($seek_addr + $got) if $got;
 	if (!defined $got) {
 		# temporary errors?
 		return 0 if $!{EINTR} || $!{EAGAIN} || $!{EWOULDBLOCK};
-		croak "read: $!";
+		die "read: $!";
 	} elsif ($got == 0) {
 		# EOF, which is permanent on non-seekable media, or maybe temporary on seekable ones.
 		$self->_set_eof(1);
