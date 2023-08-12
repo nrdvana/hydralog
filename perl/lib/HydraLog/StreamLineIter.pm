@@ -1,6 +1,7 @@
 package HydraLog::StreamLineIter;
 use Moo;
 use Carp;
+use HydraLog::SlidingArray;
 
 =head1 SYNOPSIS
 
@@ -93,26 +94,25 @@ Address of the I<start> of the most recent line returned from L</next>, L</prev>
 
 =cut
 
-has fh                   => ( is => 'ro' );
-has seekable             => ( is => 'rwp' );
-has first_line_addr      => ( is => 'rwp' );
-has line_addr            => ( is => 'rw' );
+has fh                    => ( is => 'ro' );
+has seekable              => ( is => 'rwp' );
+has first_line_addr       => ( is => 'rwp' );
+has line_addr             => ( is => 'rw' );
+has line_addr_cache_size  => ( is => 'rw', default => 1024 );
 
 # The buffer format used by this module is an arrayref of scalar refs, each
 # limited to 'buf_size' (unless it was provided by the user in which case it
 # is as big as they gave us)
-has _buffer_addr         => ( is => 'rw' );
+has _buffer_addr          => ( is => 'rw' );
 sub _buffer_len {
 	my $bufs= $_[0]->_buffers;
 	return !@$bufs? 0
 		: $_[0]->_buffer_chunk_size * $#$bufs + length ${$bufs->[-1]};
 }
-has _buffer_chunk_size   => ( is => 'rw', default => (1<<16) );
-has _buffers             => ( is => 'rw', default => sub {[]} );
-has _file_pos            => ( is => 'rw', default => 0 );
-has _line_addr_cache     => ( is => 'rw', default => sub {[]} );
-has _line_addr_cache_max => ( is => 'rw', default => 16 );
-has _line_addr_cache_idx => ( is => 'rw', default => undef );
+has _buffer_chunk_size    => ( is => 'rw', default => (1<<16) );
+has _buffers              => ( is => 'rw', default => sub {[]} );
+has _file_pos             => ( is => 'rw', default => 0 );
+has _line_addr_cache      => ( is => 'rw' );
 
 sub BUILD {
 	my ($self, $args)= @_;
@@ -124,7 +124,7 @@ sub BUILD {
 		unless defined $self->seekable;
 	if (!$self->fh && defined $args->{buffer}) {
 		@{$self->_buffers}= ref $args->{buffer}? $args->{buffer} : \$args->{buffer};
-		$self->_buffer_chunk_size(length $args->{buffer});
+		$self->_buffer_chunk_size(length ${$self->_buffers->[0]});
 	}
 	my $blen;
 	if (!defined $self->first_line_addr) {
@@ -139,6 +139,7 @@ sub BUILD {
 		: $file_addr - $file_addr % $self->_buffer_chunk_size
 	);
 	$self->_file_pos($file_addr || 0);
+	$self->_line_addr_cache(HydraLog::SlidingArray->new(size => 1024));
 }
 
 =head1 METHODS
@@ -166,40 +167,30 @@ This updates L</line_addr> if it succeeds.
 
 sub next {
 	my $self= shift;
-	my $linecache= $self->_line_addr_cache; # ref doesn't change
-	my $idx= $self->_line_addr_cache_idx;
-	if (!@$linecache) {
+	my $linecache= $self->_line_addr_cache;
+	if (!$linecache->count) {
 		# begin iteration from first_line_addr
 		my $first_nl= $self->_find_next_nl($self->first_line_addr);
 		defined $first_nl or return undef;
-		@$linecache= ( $self->first_line_addr, $first_nl+1 );
-		$idx= 0;
+		$linecache->put(0, $self->first_line_addr, $first_nl+1);
 	}
 	# linecache is initialized, so will have at least 2 entries,
 	# idx (start) and idx+1 (end), but need to add another if idx+2 doesn't exist.
-	elsif ($idx + 2 <= $#$linecache) {
-		++$idx;
-	}
 	else {
-		my $next_nl= $self->_find_next_nl($linecache->[$idx+1]);
-		defined $next_nl or return undef;
-		push @$linecache, $next_nl + 1;
-		# line_addr_cache gained an entry.  Check if one needs removed.
-		if (@$linecache > $self->_line_addr_cache_max) {
-			shift @$linecache;
-		} else {
-			++$idx;
+		unless ($linecache->max > 1) {
+			my $next_nl= $self->_find_next_nl($linecache->get(1));
+			defined $next_nl or return undef;
+			$linecache->put(2, $next_nl + 1);
 		}
+		$linecache->slide(1);
 	}
-	$self->_line_addr_cache_idx($idx);
-	return $self->_get_line($linecache->[$idx], $linecache->[$idx+1]-1);
+	return $self->_get_line($linecache->get(0,1));
 }
 
 sub prev {
 	my $self= shift;
-	my $linecache= $self->_line_addr_cache; # ref doesn't change
-	my $idx= $self->_line_addr_cache_idx;
-	if (!@$linecache) {
+	my $linecache= $self->_line_addr_cache;
+	if (!$linecache->count) {
 		# begin iteration from end of file, if seekable, or fully loaded in buffer
 		my $file_addr;
 		if ($self->seekable) {
@@ -213,23 +204,19 @@ sub prev {
 		defined $last_nl or return undef;
 		my $prev_nl= $self->_find_prev_nl($last_nl-1);
 		defined $prev_nl or return undef;
-		@$linecache= ( $prev_nl + 1, $last_nl + 1 );
-		$idx= 0;
+		$linecache->put(0, $prev_nl + 1, $last_nl + 1);
 	}
 	# linecache is initialized, so will have at least 2 entries,
 	# idx (start) and idx+1 (end), but need to add another if idx-1 doesn't exist.
-	elsif ($idx > 0) {
-		--$idx;
-	}
 	else {
-		my $prev_nl= $self->_find_prev_nl($linecache->[$idx]-2);
-		defined $prev_nl or return undef;
-		unshift @$linecache, $prev_nl + 1;
-		# line_addr_cache gained an entry.  Check if one needs removed.
-		pop @$linecache if @$linecache > $self->_line_addr_cache_max;
+		unless ($linecache->min < 0) {
+			my $prev_nl= $self->_find_prev_nl($linecache->get(0)-2);
+			defined $prev_nl or return undef;
+			$linecache->put(-1, $prev_nl + 1);
+		}
+		$linecache->slide(-1);
 	}
-	$self->_line_addr_cache_idx($idx);
-	return $self->_get_line($linecache->[$idx], $linecache->[$idx+1]-1);
+	return $self->_get_line($linecache->get(0,1));
 }
 
 =head2 seek
@@ -248,31 +235,34 @@ sub seek {
 	# can we load it?  (might just use cache)
 	$self->_load_addr($addr) or return undef;
 	# Is the addr within the known lines?
-	my $linecache= $self->_line_addr_cache; # ref doesn't change
-	if (@$linecache && $linecache->[0] <= $addr && $addr < $linecache->[-1]) {
-		# Binary search
-		my ($min, $max)= (0, $#$linecache);
+	my $linecache= $self->_line_addr_cache;
+	if ($linecache->count
+		&& $linecache->get($linecache->min) <= $addr
+		&& $addr < $linecache->get($linecache->max)
+	) {
+		# Binary search.  Indices must be positive, so shift linecache so min=0
+		$linecache->slide($linecache->min);
+		my ($min, $max)= (0, $linecache->max);
 		while ($min < $max) {
 			my $mid= ($min+$max+1)>>1;
-			if ($addr < $linecache->[$mid]) {
+			if ($addr < $linecache->get($mid)) {
 				$max= $mid-1;
 			} else {
 				$min= $mid;
 			}
 		}
 		if ($min == $max) {
-			$self->_line_addr_cache_idx($min);
-			return $self->_get_line($linecache->[$min], $linecache->[$min+1]-1);
+			$linecache->slide($min);
+			return $self->_get_line($linecache->get(0,1));
 		}
 	}
 	# Seek backward and forward to find bounding newline chars
 	my $prev_nl= $self->_find_prev_nl($addr-1);
 	my $next_nl= $self->_find_next_nl($addr);
 	return undef unless defined $prev_nl && defined $next_nl;
-
-	@$linecache= ( $prev_nl+1, $next_nl+1 );
-	$self->_line_addr_cache_idx(0);
-	return $self->_get_line($linecache->[0], $linecache->[1]-1);
+	$linecache->clear;
+	$linecache->put(0, $prev_nl+1, $next_nl+1);
+	return $self->_get_line($linecache->get(0,1));
 }	
 
 =head2 release_before
@@ -336,14 +326,11 @@ block containing the current line.
 
 sub _get_line {
 	my ($self, $addr0, $addr1)= @_;
-	--$addr1; # this points to the newline.  Change it to point to the final char.
+	$addr1 -= 2; # this points to the next line.  Change it to point to the final char before newline.
 	my $bs= $self->_buffer_chunk_size;
 	# Verify that the buffer chunks are loaded for this range
-	if ($addr0 < $self->_buffer_addr || $addr1 > $self->_buffer_addr + $self->_buffer_len) {
-		$self->_load_addr($_ * $bs) or return undef
-			for int($addr0 / $bs) .. int($addr1 / $bs);
-		$self->_load_addr($addr1) or return undef;
-	}
+	$self->_load_addr_range($addr0, $addr1)
+		if $addr0 < $self->_buffer_addr || $addr1 >= $self->_buffer_addr + $self->_buffer_len;
 	my $buf0_idx= int(($addr0 - $self->_buffer_addr) / $bs);
 	my $buf1_idx= int(($addr1 - $self->_buffer_addr) / $bs);
 	my $buf0_ofs= $addr0 % $bs;
@@ -437,6 +424,7 @@ sub _load_addr {
 		$self->_set_eof(1);
 		return 0;
 	} elsif ($buf_idx == -1) {
+		# Reading into an earlier block.
 		# Must read a full block, else we'd have a hole in the buffer
 		return undef unless $got == $bs;
 		unshift @{$self->_buffers}, $bufref;
@@ -449,6 +437,31 @@ sub _load_addr {
 		$self->_buffer_addr($self->_buffer_addr + $buf_idx * $bs);
 	}
 	return $got;
-}	
+}
+
+# addr1 is the final character to include, not the address beyond the character
+sub _load_addr_range {
+	my ($self, $addr0, $addr1)= @_;
+	# Ensure that the first block at least exists.  This may change the value of _buffer_addr.
+	$self->_load_addr($addr0) or return undef;
+	# Now verify that all buffers from 0..(N-1) are fully loaded, and that N is loaded to
+	# at least $addr1.
+	my $base= $self->_buffer_addr;
+	my $bs= $self->_buffer_chunk_size;
+	my $buf0_idx= int(($addr0 - $base) / $bs);
+	my $buf1_idx= int(($addr1 - $base) / $bs);
+	# These must be fully loaded
+	for ($buf0_idx .. ($buf1_idx-1)) {
+		while (length ${$self->_buffers->[$_]} < $bs) {
+			$self->_load_addr($base + $_*$bs + length ${$self->_buffers->[$_]})
+				or return undef;
+		}
+	}
+	# This needs loaded to at least length > $addr1
+	while (length ${$self->_buffers->[$buf1_idx]} < ($addr1 % $bs)) {
+		$self->_load_addr($addr1) or return undef;
+	}
+	return 1;
+}
 
 1;
