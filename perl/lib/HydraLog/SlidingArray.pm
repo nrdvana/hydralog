@@ -31,7 +31,7 @@ has _buf => ( is => 'rw', default => sub {[]} );
 has _pos => ( is => 'rw', default => 0 );
 has _min => ( is => 'rw', default => 0 );
 has _lim => ( is => 'rw', default => 0 );
-sub size { scalar @{$_[0]{buf}} }
+sub size { scalar @{$_[0]->_buf} }
 sub min { $_[0]->_min - $_[0]->_pos }
 sub max { $_[0]->_lim - $_[0]->_pos - 1 }
 sub count { $_[0]->_lim - $_[0]->_min }
@@ -57,53 +57,71 @@ sub BUILD {
 =head2 get
 
   $val= $sa->get($idx);
+  @vals= $sa->get(@idx_list);
 
 Return the value at position C<$idx> of the array.  The array logically extends infinitely
 in positive and negative directions, and any index outside the assigned values returns C<undef>.
 
+Multiple indexes can be requested, in which case they are returned in a list (always one element
+for each index requested).
+
 =cut
 
 sub get {
-	my ($self, $idx)= @_;
+	my $self= shift;
 	my $pos= $self->_pos;
-	return undef if $idx >= $self->_lim - $pos || $idx < $self->_min - $pos;
 	my $buf= $self->_buf;
-	$buf->[ ($idx+$pos) & $#$buf ];
+	if (@_ == 1) {
+		my $idx= $_[0] + $pos;
+		return $idx >= $self->_lim? undef
+			: $idx < $self->_min? undef
+			: $buf->[ $idx & $#$buf ];
+	}
+	return map {
+		my $idx= $_ + $pos;
+		$idx >= $self->_lim? undef
+		: $idx < $self->_min? undef
+		: $buf->[ $idx & $#$buf ];
+	} @_;
 }
 
 =head2 put
 
-  $sa->put($idx, $val);
+  $sa->put($idx, @vals);
 
 Store a value at an index of the array.  If the index falls outside of (L</min>..L</max>) the
 extents will be adjusted to include this index.  If changing the extents would cause there to
 be more than C<< size - 1 >> elements, some (or all) elements are dropped from the other end.
 
+If multiple values are provided, (and must be fewer than L</size> elements) they will be written
+to adjacent spots in the array starting from C<$idx>.
+
 =cut
 
 sub put {
-	my ($self, $idx, $val)= @_;
+	my ($self, $idx)= (shift,shift);
 	my $buf= $self->_buf;
 	my $pos= $self->_pos;
+	croak "Too many values" if @_ > @$buf;
 	$idx += $pos; # idx is now relative to pos, like the min/lim attributes
 	# Does this extend the 'min' attribute?
 	if ($idx < $self->_min) {
 		# idx will become the new min.  Are we keeping any of the min..lim elements?
 		my $newlim= $idx + @$buf;
 		if ($newlim > $self->_min && $self->_min < $self->_lim) {
-			# clear elements from $idx+1 to min-1
-			$buf->[ $_ & $#$buf ]= undef for +($idx+1) .. ($self->_min-1);
+			# clear elements from $idx+@vals to min-1
+			$buf->[ $_ & $#$buf ]= undef for +($idx+@_) .. ($self->_min-1);
 			# truncate lim
 			$self->_lim($newlim) if $self->_lim > $newlim;
 		} else {
-			$self->_lim($idx+1);
+			$self->_lim($idx+@_);
 		}
 		$self->_min($idx);
 	}
 	# Does this extend the 'max' attribute?
-	elsif ($idx >= $self->_lim) {
-		# idx+1 will become the new max.  Are we keeping any of the min..max elements?
-		my $newmin= $idx - @$buf + 1;
+	elsif ($idx+@_ > $self->_lim) {
+		# idx+vals will become the new max.  Are we keeping any of the min..max elements?
+		my $newmin= $idx + @_ - @$buf;
 		if ($newmin < $self->_lim && $self->_min < $self->_lim) {
 			# clear elements from $lim to $idx-1
 			$buf->[ $_ & $#$buf ]= undef for $self->_lim .. ($idx-1);
@@ -112,9 +130,10 @@ sub put {
 		} else {
 			$self->_min($idx);
 		}
-		$self->_lim($idx+1);
+		$self->_lim($idx+@_);
 	}
-	$buf->[ $idx & $#$buf ]= $val;
+	$buf->[ ($idx+$_) & $#$buf ]= $_[$_]
+		for 0..$#_;
 }
 
 =head2 slide

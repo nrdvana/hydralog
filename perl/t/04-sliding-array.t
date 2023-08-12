@@ -101,4 +101,23 @@ subtest slide_beyond_pos => sub {
 	}, 'put 0..7 slide(7)' );
 };
 
+subtest multiput_multiget => sub {
+	my $buf= HydraLog::SlidingArray->new(size => 8);
+	$buf->put(-3, -3, -2, -1, 0, 1, 2, 3, 4);
+	is( [ $buf->get(-4..5) ], [ undef, -3..4, undef ], 'write all 8' );
+	# overwrite some, preserve one, and truncate the rest.
+	$buf->put(-10, (1)x7);
+	is( [ $buf->get(-4, -3, -2) ], [ 1, -3, undef ], 'overwrite partial' );
+	# preserve none
+	$buf->put(10, 1, 2, 3);
+	is( $buf, object {
+		call min => 10;
+		call max => 12;
+		call size => 8;
+		call count => 3;
+		call [ get => 9 ], undef;
+		call [ get => 10 ], 1;
+	}, 'write 3 beyond existing' );
+};
+
 done_testing;
