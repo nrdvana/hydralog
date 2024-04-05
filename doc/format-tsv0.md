@@ -7,19 +7,19 @@ assistance.  As the name suggests, tsv0 is built on tab-separated-values.
 
 Features:
 
-  * Common plain text format with almost no formatting requirements
-  * Every record can be decoded by splitting on tab characters
-  * Supports comments for out-of-band information
-  * You can include arbitrary key=value metadata at the start of the file
+  * Plain-text tab-separated values format
+  * Each record is stored complete, and can be parsed simply by splitting on TAB
+  * Arbitrary key=value metadata for the file as a whole
+  * Arbitrary out-of-band information using comments
+  * User-defined fields in message records
   * Every record starts with timestamp, level, and message
   * Timestamp is encoded in text-sortable YYYYMMDD notation
-  * Supports additional user-defined fields
 
 Limitations:
 
-  * No data may contain any TAB or line-end characters (i.e. no escaping)
-  * Changes to the system clock show up in the timestamps
+  * Data may not contain control characters
   * Timestamp is verbose
+  * Changes to the system clock create discontinuities in timeline
   * No reduction of redundant messages
   * No reduction of common default values for fields
 
@@ -35,7 +35,7 @@ The file starts with a Unix-style directive indicating how to parse the file.
 This is not a suggestion to make your log files executable, just matching a
 common notation that quickly expresses the idea.
 
-    #!hydralog-dump --format=tsv0
+    #!hydralog-dump --in-format=tsv0
 
 The next comments may contain arbitrary metadata in key=value notation.
 The keys may not contain "=" characters, and neither may contain control
