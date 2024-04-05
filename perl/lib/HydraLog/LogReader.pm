@@ -14,21 +14,9 @@ use HydraLog::StreamLineIter;
 
 =head1 DESCRIPTION
 
-The HydraLog logfiles begin with:
-
-  #!hydralog-dump --format=tsv0
-  # start_epoch=$dt	timestamp_scale=1	$name=$value ...
-  # timestamp_step_hex=0	level=I	message	CustomField=Y
-  $TIMESTEP	$LEVEL	$MESSAGE
-  $TIMESTEP	$LEVEL	$MESSAGE
-  $TIMESTEP	$LEVEL	$MESSAGE	$CustomField
-  $TIMESTEP	$LEVEL	$MESSAGE
-
-In short, this tells us the file format (while self-documenting how to process the file)
-various attributes of the file, a list of the fields that will appear in each row,
-and then the rows themselves.
-
-The $TIMESTAMP values are hex number of C<< seconds * $ts_scale >> since the start_epoch.
+This object reads Hydralog log files.  It supports various formats, and can detect the format
+from a supplied file handle.  It can also seek on a file to a requested timestamp, assuming the
+file was written with correctly monotonic timestamps.
 
 =head1 CONSTRUCTOR
 
@@ -43,8 +31,8 @@ Shortcut for C<< ->new(filename => $name) >>
 =cut
 
 sub open {
-	my ($class, $filename)= @_;
-	$class->new(filename => $filename);
+   my ($class, $filename, %options)= @_;
+   $class->new(filename => $filename, %options);
 }
 sub BUILD {
 	my ($self, $args)= @_;
@@ -264,126 +252,6 @@ sub seek_last {
 	# TODO: If the file contains index comments, read backward until the
 	# first index point.
 	$self->{next}= $self->_parse_line($last_line);
-}
-
-=head1 LOG RECORDS
-
-The log records are a blessed hashref of the fields of a log record.  Some fields have
-official meaning, but others are just ad-hoc custom fields defined by the user.
-
-All fields can be accessed as attributes, including the ad-hoc custom ones via AUTOLOAD.
-Reading the C<timestamp> returns the same integer that was read from the file (but
-decoded from hex).  There is a virtual field C<epoch> which scales and adds the timestamp
-to the C<start_epoch> of the log file.
-
-=head2 ATTRIBUTES
-
-=over
-
-=item C<to_string>
-
-Not exactly an attribute, this renders the record in "a useful and sensible manner", which
-for now means timestamp in local time, level, facility, ident, and message.  It does not
-include a trailing newline.
-
-=item C<timestamp>
-
-Unix epoch number, which may contain fractional decimal places  if the timestamps are
-sub-second precision.
-
-=item C<timestamp_local>
-
-The timestamp, converted to local time zone in C<< YYYY-MM-DD HH:MM::SS[.x] >> format.
-
-=item C<timestamp_iso8601>
-
-The timestamp, in ISO-8601 C<< YYYY-MM-DDTHH:MM:SS[.x]Z >> format.
-
-=item C<level>
-
-Log level, which can be any string, but is usually normalized to one of:
-
-  EMERGENCY
-  ALERT
-  CRITICAL
-  ERROR
-  WARNING
-  NOTICE
-  INFO
-  DEBUG
-  TRACE
-
-=item C<facility>
-
-The syslog facility name.  This is a string, not guaranteed to match any of the constants
-on your local C library.
-
-=item C<identity>
-
-The program name that generated the message.  In messages from syslog, this is the
-portion before ':' in the logged string.
-
-=item C<message>
-
-The message text.
-
-=item C<*>
-
-Any other field whose name is composed of C<< /\w+/ >> can be accessed as an attribute, but
-you get an exception if the field wasn't defined for this log.  This object does not have
-any private fields, so you may access C<< ->{$field} >> rather than using an accessor.
-
-=back
-
-=cut
-
-package HydraLog::LogReader::Record {
-	use strict;
-	use warnings;
-	use overload '""' => sub { $_[0]->to_string };
-
-	sub timestamp { $_[0]{timestamp} }
-	sub level     { $_[0]{level} }
-	sub facility  { $_[0]{facility} }
-	sub identity  { $_[0]{identity} }
-	sub message   { $_[0]{message} }
-
-	sub timestamp_utc {
-		my $epoch= $_[0]->timestamp or return undef;
-		my ($sec, $min, $hour, $mday, $mon, $year)= gmtime $epoch;
-		return sprintf "%04d-%02d-%02dT%02d:%02d:%02d%sZ",
-			$year+1900, $mon+1, $mday, $hour, $min, $sec,
-			($epoch =~ /(\.\d+)$/? $1 : '');
-	}
-	*timestamp_iso8601= *timestamp_utc;
-
-	sub timestamp_local {
-		my $epoch= $_[0]->timestamp or return undef;
-		my ($sec, $min, $hour, $mday, $mon, $year)= localtime $epoch;
-		return sprintf "%04d-%02d-%02d %02d:%02d:%02d%s",
-			$year+1900, $mon+1, $mday, $hour, $min, $sec,
-			($epoch =~ /(\.\d+)$/? $1 : '');
-	}
-
-	sub to_string {
-		my $self= shift;
-		return join ' ',
-			(defined $self->{timestamp}? ( $self->timestamp_local ) : ()),
-			(defined $self->{level}?     ( $self->level ) : ()),
-			(defined $self->{facility}?  ( $self->facility ) : ()),
-			(defined $self->{identity}?  ( $self->identity.':' ) : ()),
-			(defined $self->{message}?   ( $self->message ) : ());
-	}
-
-	sub AUTOLOAD {
-		$HydraLog::LogReader::Record::AUTOLOAD =~ /::(\w+)$/;
-		return if $1 eq 'DESTROY' || $1 eq 'import';
-		Carp::croak("No such field '$1'") unless defined $_[0]{$1};
-		my $field= $1;
-		no strict 'refs';
-		*{"HydraLog::LogReader::Record::$field"}= sub { $_[0]{$field} };
-		return $_[0]{$field};
-	}
 }
 
 1;
