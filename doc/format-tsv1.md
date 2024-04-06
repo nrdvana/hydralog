@@ -54,21 +54,20 @@ Where NAME is the logical field name, ENCODING indicates how it is stored, and
 DEFAULT is a literal value to use when the field is zero-length.  DEFAULT may
 itself be zero-length meaning that the field may have an empty value.
 
-#### Field "timestamp"
+#### Field "dT"
 
-The first field must always be 'timestamp'.  Timestamps are always integer
+The first field must always be 'dT'.  Timestamps are always integer
 seconds unless you specify an encoding of "*N", which means the (fractional)
 number of seconds has been multiplied by N before truncating to an integer.
 
 Consider this partial example:
 
     #% start_epoch=2020-01-01T00:00:00Z
-    #: timestamp:*10
+    #: dT:*10
     1       0.1 seconds beyond start_epoch
 
 Timestamps cannot use a DEFAULT value because an empty timestamp is an
-indication of a continuation of the previous record.  Also there would be no
-point in having a default timestamp.
+indication of a continuation of the previous record.
 
 #### Any text field
 
@@ -82,7 +81,7 @@ line of text that begins with TAB is a continuation of a previous record.
 Aside from thise two special cases, the record is simply a TAB-concatenated
 list of field values.
 
-#### Field "timestamp"
+#### Field "dT"
 
 The first field is the timestamp.  Timestamps are encoded as a base64
 integer using the alphabet "0-9 A-Z a-z _ -".  The count is an offset from the
@@ -122,7 +121,7 @@ viewing the file)
 Consider this example where both the message and a custom user field contain
 multiple lines (and rendering tabs as multiple of 8 spaces):
 
-    #: timestamp    message custom1
+    #: dT   message custom1
     0       Message One
             Line two        Custom line 1
                     Custom line 2
