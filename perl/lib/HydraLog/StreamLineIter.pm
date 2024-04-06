@@ -144,7 +144,7 @@ sub BUILD {
       : $file_addr - $file_addr % $self->_buffer_chunk_size
    );
    $self->_file_pos($file_addr || 0);
-   $self->_line_addr_cache(HydraLog::SlidingArray->new(size => 1024));
+   $self->_line_addr_cache(HydraLog::SlidingArray->new(size => $self->line_addr_cache_size));
 }
 
 =head1 METHODS
@@ -331,6 +331,12 @@ block containing the current line.
 
 sub _get_line {
    my ($self, $addr0, $addr1)= @_;
+   # In void context, just update the line markers
+   if (!defined wantarray) {
+      $self->_set_line_addr($addr0);
+      $self->_set_next_line_addr($addr1);
+      return;
+   }
    $addr1 -= 2; # this points to the next line.  Change it to point to the final char before newline.
    my $bs= $self->_buffer_chunk_size;
    # Verify that the buffer chunks are loaded for this range
@@ -348,7 +354,11 @@ sub _get_line {
    # The line is split across one or more buffers
    my $ret= substr(${$self->_buffers->[$buf0_idx]}, $buf0_ofs);
    $ret .= ${$self->_buffers->[$_]} for +($buf0_idx+1) .. ($buf1_idx-1);
-   return $ret .= substr(${$self->_buffers->[$buf1_idx]}, 0, $buf1_ofs+1);
+   $ret .= substr(${$self->_buffers->[$buf1_idx]}, 0, $buf1_ofs+1);
+   # chomp off any final \r
+   local $/= "\r";
+   chomp $ret;
+   return $ret;
 }
 
 sub _find_next_nl {
